@@ -1,0 +1,486 @@
+import cv2
+import mediapipe as mp
+import pandas as pd
+from ultralytics import YOLO
+
+
+VIDEO_PATH = r"C:\Users\sooch\Downloads\jugg_test_new.mp4"
+
+HAND_MODEL_PATH = r"C:\Users\sooch\Downloads\hand_landmarker.task"
+
+OUTPUT_VIDEO = r"C:\Users\sooch\Downloads\jugg_body_hand_annotated.mp4"
+
+OUTPUT_BODY_CSV = r"C:\Users\sooch\Downloads\body_pose_coordinates.csv"
+
+OUTPUT_HAND_CSV = r"C:\Users\sooch\Downloads\hand_pose_coordinates.csv"
+
+
+print("Loading YOLO body pose model...")
+
+pose_model = YOLO("yolo11n-pose.pt")
+
+
+print("Loading MediaPipe hand model...")
+
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+RunningMode = mp.tasks.vision.RunningMode
+
+hand_options = HandLandmarkerOptions(
+    base_options=BaseOptions(
+        model_asset_path=HAND_MODEL_PATH
+    ),
+    running_mode=RunningMode.VIDEO,
+    num_hands=2,
+    min_hand_detection_confidence=0.3,
+    min_hand_presence_confidence=0.3,
+    min_tracking_confidence=0.3
+)
+
+hand_model = HandLandmarker.create_from_options(
+    hand_options
+)
+
+
+
+BODY_NAMES = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle"
+]
+
+
+
+HAND_NAMES = [
+    "wrist",
+    "thumb_cmc",
+    "thumb_mcp",
+    "thumb_ip",
+    "thumb_tip",
+    "index_mcp",
+    "index_pip",
+    "index_dip",
+    "index_tip",
+    "middle_mcp",
+    "middle_pip",
+    "middle_dip",
+    "middle_tip",
+    "ring_mcp",
+    "ring_pip",
+    "ring_dip",
+    "ring_tip",
+    "pinky_mcp",
+    "pinky_pip",
+    "pinky_dip",
+    "pinky_tip"
+]
+
+
+
+HAND_CONNECTIONS = [
+
+    # Thumb
+    (0, 1),
+    (1, 2),
+    (2, 3),
+    (3, 4),
+
+    # Index
+    (0, 5),
+    (5, 6),
+    (6, 7),
+    (7, 8),
+
+    # Middle
+    (5, 9),
+    (9, 10),
+    (10, 11),
+    (11, 12),
+
+    # Ring
+    (9, 13),
+    (13, 14),
+    (14, 15),
+    (15, 16),
+
+    # Pinky
+    (13, 17),
+    (17, 18),
+    (18, 19),
+    (19, 20),
+
+    # Palm
+    (0, 17)
+]
+
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+if not cap.isOpened():
+    raise RuntimeError("Could not open video.")
+
+
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+width = int(
+    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+)
+
+height = int(
+    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+)
+
+total_frames = int(
+    cap.get(cv2.CAP_PROP_FRAME_COUNT)
+)
+
+
+print("FPS:", fps)
+print("Resolution:", width, "x", height)
+print("Frames:", total_frames)
+
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+writer = cv2.VideoWriter(
+    OUTPUT_VIDEO,
+    fourcc,
+    fps,
+    (width, height)
+)
+
+
+body_data = []
+hand_data = []
+
+
+frame_number = 0
+
+
+while True:
+
+    success, frame = cap.read()
+
+    if not success:
+        break
+
+
+    time_seconds = frame_number / fps
+
+    timestamp_ms = int(
+        time_seconds * 1000
+    )
+
+
+    pose_results = pose_model(
+        frame,
+        verbose=False
+    )
+
+    pose_result = pose_results[0]
+
+
+    annotated_frame = pose_result.plot()
+
+
+    if (
+        pose_result.keypoints is not None
+        and pose_result.keypoints.xy is not None
+    ):
+
+        keypoints_xy = (
+            pose_result.keypoints.xy
+            .cpu()
+            .numpy()
+        )
+
+        keypoints_conf = None
+
+        if pose_result.keypoints.conf is not None:
+
+            keypoints_conf = (
+                pose_result.keypoints.conf
+                .cpu()
+                .numpy()
+            )
+
+
+        # Usually one person, but this supports multiple people
+        for person_id, person_points in enumerate(keypoints_xy):
+
+            for keypoint_id, point in enumerate(person_points):
+
+                x = float(point[0])
+                y = float(point[1])
+
+                confidence = None
+
+                if keypoints_conf is not None:
+                    confidence = float(
+                        keypoints_conf[person_id][keypoint_id]
+                    )
+
+
+                body_data.append({
+
+                    "frame": frame_number,
+
+                    "time_seconds": time_seconds,
+
+                    "person_id": person_id,
+
+                    "keypoint_id": keypoint_id,
+
+                    "keypoint_name":
+                        BODY_NAMES[keypoint_id],
+
+                    "x": x,
+
+                    "y": y,
+
+                    "confidence": confidence
+
+                })
+
+    rgb = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
+
+
+    mp_image = mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb
+    )
+
+
+    hand_results = hand_model.detect_for_video(
+        mp_image,
+        timestamp_ms
+    )
+
+
+    for hand_index, hand_landmarks in enumerate(
+        hand_results.hand_landmarks
+    ):
+
+        hand_label = "Unknown"
+        hand_score = None
+
+
+        if hand_index < len(hand_results.handedness):
+
+            handedness = (
+                hand_results.handedness[hand_index]
+            )
+
+            if len(handedness) > 0:
+
+                hand_label = handedness[0].category_name
+
+                hand_score = handedness[0].score
+
+        points = []
+
+
+        for landmark_id, landmark in enumerate(
+            hand_landmarks
+        ):
+
+            x = int(
+                landmark.x * width
+            )
+
+            y = int(
+                landmark.y * height
+            )
+
+            points.append(
+                (x, y)
+            )
+
+            hand_data.append({
+
+                "frame": frame_number,
+
+                "time_seconds": time_seconds,
+
+                "hand_id": hand_index,
+
+                "hand":
+                    hand_label,
+
+                "hand_confidence":
+                    hand_score,
+
+                "landmark_id":
+                    landmark_id,
+
+                "landmark_name":
+                    HAND_NAMES[landmark_id],
+
+                "x":
+                    x,
+
+                "y":
+                    y,
+
+                "x_normalized":
+                    landmark.x,
+
+                "y_normalized":
+                    landmark.y,
+
+                "z_normalized":
+                    landmark.z
+
+            })
+
+
+        for start, end in HAND_CONNECTIONS:
+
+            cv2.line(
+                annotated_frame,
+                points[start],
+                points[end],
+                (255, 255, 255),
+                2
+            )
+
+
+        for landmark_id, (x, y) in enumerate(points):
+
+            cv2.circle(
+                annotated_frame,
+                (x, y),
+                4,
+                (0, 255, 0),
+                -1
+            )
+
+        if len(points) > 0:
+
+            wrist_x, wrist_y = points[0]
+
+            cv2.putText(
+                annotated_frame,
+                hand_label,
+                (
+                    wrist_x + 10,
+                    wrist_y + 20
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2
+            )
+
+    cv2.putText(
+        annotated_frame,
+        f"Frame: {frame_number}",
+        (20, 35),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
+
+    cv2.putText(
+        annotated_frame,
+        f"Time: {time_seconds:.2f}s",
+        (20, 70),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2
+    )
+
+    writer.write(
+        annotated_frame
+    )
+
+
+    cv2.imshow(
+        "Body + Hand Tracking",
+        annotated_frame
+    )
+
+
+    frame_number += 1
+
+
+    # Progress
+    if frame_number % 30 == 0:
+
+        print(
+            f"Processed "
+            f"{frame_number}/{total_frames} frames"
+        )
+
+
+    # Press Q to stop
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+
+cap.release()
+
+writer.release()
+
+cv2.destroyAllWindows()
+
+hand_model.close()
+
+
+body_df = pd.DataFrame(
+    body_data
+)
+
+body_df.to_csv(
+    OUTPUT_BODY_CSV,
+    index=False
+)
+
+
+hand_df = pd.DataFrame(
+    hand_data
+)
+
+hand_df.to_csv(
+    OUTPUT_HAND_CSV,
+    index=False
+)
+
+
+print()
+print("======================================")
+print("FINISHED")
+print("======================================")
+
+print("Annotated video:")
+print(OUTPUT_VIDEO)
+
+print()
+
+print("Body coordinates:")
+print(OUTPUT_BODY_CSV)
+
+print()
+
+print("Hand coordinates:")
+print(OUTPUT_HAND_CSV)
