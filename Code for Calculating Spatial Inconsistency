@@ -1,0 +1,430 @@
+!pip install ultralytics opencv-python pandas numpy -q
+
+import cv2
+import numpy as np
+import pandas as pd
+import os
+from pathlib import Path
+from dataclasses import dataclass
+from collections import defaultdict
+
+from ultralytics import YOLO
+
+VIDEO_FOLDER = "/content/drive/MyDrive/SPAT_INC_VIDS"
+
+BALL_MODEL_PATH = "/content/drive/MyDrive/Model_Paths/ball_detection_best.pt"
+POSE_MODEL_PATH = "yolov8n-pose.pt"
+
+OUTPUT_DIR = "/content/drive/MyDrive/spatial_outputs"
+
+CONF_BALL = 0.30
+CONF_POSE = 0.50
+
+WIDTH_FACTOR = 1.00
+BOTTOM_EXTENSION_FACTOR = 0.00
+
+MIN_THROW_HEIGHT_PX = 50
+MIN_FRAMES_BETWEEN_THROWS = 36
+TRAJECTORY_WINDOW = 13
+
+EXCLUDE_UNCAUGHT_THROWS = False
+CATCH_WINDOW_FRAMES = 60
+HAND_PROXIMITY_PX = 90
+
+VIDEO_EXTENSIONS = [".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI", ".mkv", ".MKV"]
+
+@dataclass
+class ThrowEvent:
+    throw_frame: int
+    ball_id: int
+    peak_x: float
+    peak_y: float
+    radius: float
+    is_caught: bool = True
+    is_erratic: bool = False
+
+
+@dataclass
+class JugglingFrame:
+    left: float
+    right: float
+    top: float
+    bottom: float
+
+    def ball_entirely_outside(self, cx, cy, radius=0):
+        return (
+            cx + radius < self.left or
+            cx - radius > self.right or
+            cy + radius < self.top or
+            cy - radius > self.bottom
+        )
+
+
+KP_NOSE = 0
+KP_LEFT_SHLD = 5
+KP_RIGHT_SHLD = 6
+KP_LEFT_WRIST = 9
+KP_RIGHT_WRIST = 10
+KP_LEFT_HIP = 11
+KP_RIGHT_HIP = 12
+
+
+def get_keypoint(kps, idx, conf_thresh=0.3):
+    if kps is None or idx >= len(kps):
+        return None
+
+    kp = kps[idx]
+
+    if len(kp) >= 3 and kp[2] < conf_thresh:
+        return None
+
+    return float(kp[0]), float(kp[1])
+
+
+def build_juggling_frame(kps, frame_h, frame_w):
+    ls = get_keypoint(kps, KP_LEFT_SHLD)
+    rs = get_keypoint(kps, KP_RIGHT_SHLD)
+    lh = get_keypoint(kps, KP_LEFT_HIP)
+    rh = get_keypoint(kps, KP_RIGHT_HIP)
+    nose = get_keypoint(kps, KP_NOSE)
+
+    if ls is None or rs is None or lh is None or rh is None:
+        return None
+
+    shoulder_width = abs(ls[0] - rs[0])
+    sternum_x = (ls[0] + rs[0]) / 2
+    sternum_y = (ls[1] + rs[1]) / 2
+
+    frame_left = sternum_x - shoulder_width * WIDTH_FACTOR
+    frame_right = sternum_x + shoulder_width * WIDTH_FACTOR
+
+    crotch_y = (lh[1] + rh[1]) / 2
+
+    if nose is not None:
+        head_top_y = nose[1] - (sternum_y - nose[1]) * 0.3
+        head_height = sternum_y - head_top_y
+        frame_top = head_top_y - head_height
+    else:
+        torso_h = crotch_y - sternum_y
+        frame_top = sternum_y - torso_h
+
+    extra_down = BOTTOM_EXTENSION_FACTOR * (crotch_y - sternum_y)
+    frame_bottom = crotch_y + extra_down
+
+    return JugglingFrame(
+        left=max(0, frame_left),
+        right=min(frame_w, frame_right),
+        top=max(0, frame_top),
+        bottom=min(frame_h, frame_bottom),
+    )
+
+
+class ThrowDetector:
+    def __init__(self):
+        self.ball_trajectories = defaultdict(list)
+        self.detected_throws = []
+        self.last_peak_frame = {}
+
+    def update(self, frame_idx, tracked_balls):
+        for ball_id, cx, cy, radius in tracked_balls:
+            traj = self.ball_trajectories[ball_id]
+            traj.append((frame_idx, float(cx), float(cy), float(radius)))
+
+            if len(traj) > TRAJECTORY_WINDOW:
+                traj.pop(0)
+
+        for ball_id, traj in self.ball_trajectories.items():
+            if len(traj) < 7:
+                continue
+
+            mid = len(traj) // 2
+            peak_frame, peak_x, peak_y, peak_r = traj[mid]
+
+            is_peak = (
+                all(peak_y <= p[2] for p in traj[:mid]) and
+                all(peak_y <= p[2] for p in traj[mid + 1:])
+            )
+
+            if not is_peak:
+                continue
+
+            last = self.last_peak_frame.get(ball_id, -999)
+
+            if peak_frame - last <= MIN_FRAMES_BETWEEN_THROWS:
+                continue
+
+            max_y = max(p[2] for p in traj)
+
+            if max_y - peak_y >= MIN_THROW_HEIGHT_PX:
+                self.last_peak_frame[ball_id] = peak_frame
+
+                self.detected_throws.append(
+                    ThrowEvent(
+                        throw_frame=int(peak_frame),
+                        ball_id=int(ball_id),
+                        peak_x=float(peak_x),
+                        peak_y=float(peak_y),
+                        radius=float(peak_r),
+                    )
+                )
+
+    def get_throws(self):
+        return self.detected_throws
+
+class JugglingSpatialAnalyser:
+    def __init__(self, video_path, ball_model, pose_model):
+        self.video_path = video_path
+        self.file_name = os.path.basename(video_path)
+        self.video_stem = Path(video_path).stem
+
+        self.output_box_coordinates_csv = f"{OUTPUT_DIR}/{self.video_stem}_pose_box_coordinates.csv"
+        self.output_spatial_summary_csv = f"{OUTPUT_DIR}/{self.video_stem}_spatial_inconsistency_summary.csv"
+
+        self.ball_model = ball_model
+        self.pose_model = pose_model
+
+        self.throw_detector = ThrowDetector()
+
+        self.juggling_frames = {}
+        self.hand_positions = defaultdict(list)
+        self.ball_history = defaultdict(list)
+
+        self.frame_box_rows = []
+
+    def _get_closest_frame_box(self, frame_number):
+        if not self.juggling_frames:
+            return None
+
+        closest_frame = min(
+            self.juggling_frames.keys(),
+            key=lambda f: abs(f - frame_number)
+        )
+
+        return self.juggling_frames[closest_frame]
+
+    def analyse_video(self):
+        cap = cv2.VideoCapture(self.video_path)
+
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video: {self.video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        if fps <= 0:
+            fps = 30
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        print(f"\n[INFO] Processing: {self.file_name}")
+        print(f"[INFO] Video loaded: {width}x{height}, {fps:.1f} fps, {total_frames} frames")
+
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+
+            if not ret:
+                break
+
+            time_sec = frame_idx / fps
+            jf = None
+
+            pose_results = self.pose_model(frame, conf=CONF_POSE, verbose=False)
+
+            if pose_results and pose_results[0].keypoints is not None:
+                kps_all = pose_results[0].keypoints.data.cpu().numpy()
+
+                if len(kps_all) > 0:
+                    boxes = pose_results[0].boxes.xyxy.cpu().numpy()
+                    areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+                    best_person = int(np.argmax(areas))
+
+                    kps = kps_all[best_person]
+                    jf = build_juggling_frame(kps, height, width)
+
+                    if jf is not None:
+                        self.juggling_frames[frame_idx] = jf
+
+                        self.frame_box_rows.append({
+                            "file_name": self.file_name,
+                            "frame": frame_idx,
+                            "time_sec": round(time_sec, 4),
+                            "study_frame_left": round(jf.left, 2),
+                            "study_frame_right": round(jf.right, 2),
+                            "study_frame_top": round(jf.top, 2),
+                            "study_frame_bottom": round(jf.bottom, 2),
+                            "study_frame_width": round(jf.right - jf.left, 2),
+                            "study_frame_height": round(jf.bottom - jf.top, 2),
+                        })
+
+                    left_wrist = get_keypoint(kps, KP_LEFT_WRIST)
+                    right_wrist = get_keypoint(kps, KP_RIGHT_WRIST)
+
+                    if left_wrist is not None:
+                        self.hand_positions[frame_idx].append(left_wrist)
+
+                    if right_wrist is not None:
+                        self.hand_positions[frame_idx].append(right_wrist)
+
+            ball_results = self.ball_model.track(
+                frame,
+                conf=CONF_BALL,
+                persist=True,
+                verbose=False,
+            )
+
+            tracked_balls = []
+
+            if ball_results and ball_results[0].boxes is not None:
+                boxes = ball_results[0].boxes
+                ids = boxes.id
+                xyxy = boxes.xyxy.cpu().numpy()
+
+                for i, box in enumerate(xyxy):
+                    x1, y1, x2, y2 = box
+
+                    cx = float((x1 + x2) / 2)
+                    cy = float((y1 + y2) / 2)
+                    r = float(max(x2 - x1, y2 - y1) / 2)
+
+                    ball_id = int(ids[i].item()) if ids is not None else i
+
+                    tracked_balls.append((ball_id, cx, cy, r))
+                    self.ball_history[ball_id].append((frame_idx, cx, cy, r))
+
+            self.throw_detector.update(frame_idx, tracked_balls)
+
+            frame_idx += 1
+
+            if frame_idx % 100 == 0:
+                print(f"[INFO] Processed {frame_idx}/{total_frames} frames")
+
+        cap.release()
+
+        return self._compute_results(fps)
+
+    def _throw_was_caught(self, throw):
+        history = self.ball_history.get(throw.ball_id, [])
+
+        after_peak = [
+            p for p in history
+            if throw.throw_frame < p[0] <= throw.throw_frame + CATCH_WINDOW_FRAMES
+        ]
+
+        for f, cx, cy, r in after_peak:
+            if f not in self.hand_positions:
+                continue
+
+            for hx, hy in self.hand_positions[f]:
+                dist = np.hypot(cx - hx, cy - hy)
+
+                if dist <= HAND_PROXIMITY_PX:
+                    return True
+
+        return False
+
+    def _compute_results(self, fps):
+        throws = self.throw_detector.get_throws()
+
+        countable_throws = []
+        erratic_throws = []
+
+        for throw in throws:
+            if EXCLUDE_UNCAUGHT_THROWS:
+                throw.is_caught = self._throw_was_caught(throw)
+            else:
+                throw.is_caught = True
+
+            if not throw.is_caught:
+                continue
+
+            jf = self._get_closest_frame_box(throw.throw_frame)
+
+            if jf is not None:
+                throw.is_erratic = jf.ball_entirely_outside(
+                    throw.peak_x,
+                    throw.peak_y,
+                    throw.radius,
+                )
+            else:
+                throw.is_erratic = False
+
+            countable_throws.append(throw)
+
+            if throw.is_erratic:
+                erratic_throws.append(throw)
+
+        total = len(countable_throws)
+        erratic = len(erratic_throws)
+        ratio = erratic / total if total > 0 else None
+
+        box_df = pd.DataFrame(self.frame_box_rows)
+        box_df.to_csv(self.output_box_coordinates_csv, index=False)
+
+        spatial_summary_df = pd.DataFrame([{
+            "file_name": self.file_name,
+            "total_throws": int(total),
+            "total_erratic_throws": int(erratic),
+            "spatial_inconsistency_ratio": round(float(ratio), 4) if ratio is not None else None
+        }])
+
+        spatial_summary_df.to_csv(self.output_spatial_summary_csv, index=False)
+
+        return {
+            "file_name": self.file_name,
+            "total_throws": int(total),
+            "total_erratic_throws": int(erratic),
+            "spatial_inconsistency_ratio": round(float(ratio), 4) if ratio is not None else None,
+            "box_csv": self.output_box_coordinates_csv,
+            "summary_csv": self.output_spatial_summary_csv
+        }
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("[INFO] Loading models once...")
+    ball_model = YOLO(BALL_MODEL_PATH)
+    pose_model = YOLO(POSE_MODEL_PATH)
+
+    video_files = []
+
+    for ext in VIDEO_EXTENSIONS:
+        video_files.extend(Path(VIDEO_FOLDER).glob(f"*{ext}"))
+
+    video_files = sorted(video_files)
+
+    if len(video_files) == 0:
+        raise FileNotFoundError(f"No videos found in folder: {VIDEO_FOLDER}")
+
+    print(f"[INFO] Found {len(video_files)} videos.")
+
+    for video_file in video_files:
+        analyser = JugglingSpatialAnalyser(
+            video_path=str(video_file),
+            ball_model=ball_model,
+            pose_model=pose_model
+        )
+
+        results = analyser.analyse_video()
+
+        print("\n" + "=" * 60)
+        print("SPATIAL INCONSISTENCY RESULTS")
+        print("=" * 60)
+        print(f"File name                 : {results['file_name']}")
+        print(f"Total throws              : {results['total_throws']}")
+        print(f"Total erratic throws      : {results['total_erratic_throws']}")
+        print(f"Spatial inconsistency     : {results['spatial_inconsistency_ratio']}")
+        print(f"Saved box CSV             : {results['box_csv']}")
+        print(f"Saved summary CSV         : {results['summary_csv']}")
+        print("=" * 60)
+
+    print("\nDONE.")
+    print("For each video, only 2 CSV files were saved:")
+    print("1. pose box coordinates CSV")
+    print("2. spatial inconsistency summary CSV")
+
+
+if __name__ == "__main__":
+    main()
