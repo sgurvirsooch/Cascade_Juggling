@@ -1,0 +1,527 @@
+import cv2
+import math
+import csv
+import os
+from pathlib import Path
+from ultralytics import YOLO
+
+BALL_MODEL_PATH = "/content/drive/MyDrive/Model_Paths/ball_detection_best.pt"
+HAND_MODEL_PATH = "/content/drive/MyDrive/Model_Paths/best.pt"
+
+VIDEO_FOLDER = "/content/drive/MyDrive/day 3/training"
+OUTPUT_FOLDER = "/content/drive/MyDrive"
+
+JUGG_CONDITION = "jugg_training"
+
+VIDEO_EXTENSIONS = [".mp4", ".MP4", ".mov", ".MOV", ".avi", ".AVI"]
+
+BALL_CONF = 0.2
+HAND_CONF = 0.7
+
+MAX_BALLS_PER_FRAME = 3
+MAX_HANDS_PER_FRAME = 2
+
+TRIAL_GAP_SECONDS = 1.25
+MIN_FRAMES_BETWEEN_CATCHES = 5
+MIN_CATCHES_TO_SAVE_TRIAL = 1
+
+FLOOR_IGNORE_PERCENT = 0.8
+
+BALL_MATCH_DISTANCE = 140
+BALL_TRACK_TTL = 8
+
+HAND_BOX_WIDTH = 150
+HAND_BOX_HEIGHT = 150
+HAND_BOX_Y_OFFSET = 20
+HAND_BOX_SMOOTHING = 0.35
+HAND_BOX_TTL = 20
+
+MIN_DOWN_SPEED = 2
+AIRBORNE_ABOVE_HAND_PIXELS = 20
+
+SKIP_SECONDS = 10
+
+OUTPUT_WIDTH = 720
+OUTPUT_HEIGHT = 1280
+
+
+def dist(p1, p2):
+    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+
+
+def point_in_box(point, box):
+    x, y = point
+    x1, y1, x2, y2 = box
+    return x1 <= x <= x2 and y1 <= y <= y2
+
+
+def box_center(box):
+    x1, y1, x2, y2 = box
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def reset_catch_state_for_new_trial(tracks):
+    for track in tracks:
+        track["was_airborne"] = True
+        track["inside_hand_last_frame"] = False
+
+
+def get_yolo_objects(model, frame, conf_threshold, max_objects):
+    results = model(frame, conf=conf_threshold, verbose=False)[0]
+    detections = []
+
+    if results.boxes is None:
+        return detections
+
+    for box in results.boxes:
+        conf = float(box.conf[0])
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+
+        detections.append({
+            "center": (cx, cy),
+            "box": (int(x1), int(y1), int(x2), int(y2)),
+            "conf": conf
+        })
+
+    detections = sorted(detections, key=lambda d: d["conf"], reverse=True)
+    return detections[:max_objects]
+
+
+def make_box_around_hand(hand_detection, width, height):
+    x1, y1, x2, y2 = hand_detection["box"]
+
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2) + HAND_BOX_Y_OFFSET
+
+    bx1 = cx - HAND_BOX_WIDTH // 2
+    by1 = cy - HAND_BOX_HEIGHT // 2
+    bx2 = cx + HAND_BOX_WIDTH // 2
+    by2 = cy + HAND_BOX_HEIGHT // 2
+
+    bx1 = clamp(bx1, 0, width - 1)
+    by1 = clamp(by1, 0, height - 1)
+    bx2 = clamp(bx2, 0, width - 1)
+    by2 = clamp(by2, 0, height - 1)
+
+    return int(bx1), int(by1), int(bx2), int(by2)
+
+
+def smooth_box(old_box, new_box):
+    ox1, oy1, ox2, oy2 = old_box
+    nx1, ny1, nx2, ny2 = new_box
+
+    sx1 = int((HAND_BOX_SMOOTHING * ox1) + ((1 - HAND_BOX_SMOOTHING) * nx1))
+    sy1 = int((HAND_BOX_SMOOTHING * oy1) + ((1 - HAND_BOX_SMOOTHING) * ny1))
+    sx2 = int((HAND_BOX_SMOOTHING * ox2) + ((1 - HAND_BOX_SMOOTHING) * nx2))
+    sy2 = int((HAND_BOX_SMOOTHING * oy2) + ((1 - HAND_BOX_SMOOTHING) * ny2))
+
+    return sx1, sy1, sx2, sy2
+
+
+def update_hand_boxes(hand_detections, previous_hand_boxes, width, height):
+    new_boxes = []
+
+    for h in hand_detections[:MAX_HANDS_PER_FRAME]:
+        new_boxes.append(make_box_around_hand(h, width, height))
+
+    if len(previous_hand_boxes) == 0:
+        return [{"box": b, "missing": 0} for b in new_boxes]
+
+    updated = []
+    used_old = set()
+
+    for new_box in new_boxes:
+        new_c = box_center(new_box)
+
+        best_i = None
+        best_d = 99999
+
+        for i, old in enumerate(previous_hand_boxes):
+            if i in used_old:
+                continue
+
+            old_c = box_center(old["box"])
+            d = dist(new_c, old_c)
+
+            if d < best_d:
+                best_d = d
+                best_i = i
+
+        if best_i is not None:
+            used_old.add(best_i)
+            old_box = previous_hand_boxes[best_i]["box"]
+
+            updated.append({
+                "box": smooth_box(old_box, new_box),
+                "missing": 0
+            })
+
+        else:
+            updated.append({
+                "box": new_box,
+                "missing": 0
+            })
+
+    for i, old in enumerate(previous_hand_boxes):
+        if i not in used_old and old["missing"] < HAND_BOX_TTL:
+            updated.append({
+                "box": old["box"],
+                "missing": old["missing"] + 1
+            })
+
+    return updated[:MAX_HANDS_PER_FRAME]
+
+
+def update_ball_tracks(ball_detections, tracks, frame_num):
+    detections = [d["center"] for d in ball_detections]
+    used_detections = set()
+
+    for track in tracks:
+        track["updated"] = False
+
+    for track in tracks:
+        best_i = None
+        best_d = 99999
+
+        for i, c in enumerate(detections):
+            if i in used_detections:
+                continue
+
+            d = dist(track["center"], c)
+
+            if d < best_d:
+                best_d = d
+                best_i = i
+
+        if best_i is not None and best_d <= BALL_MATCH_DISTANCE:
+            new_center = detections[best_i]
+            old_center = track["center"]
+
+            track["prev_center"] = old_center
+            track["center"] = new_center
+            track["vy"] = new_center[1] - old_center[1]
+            track["last_seen"] = frame_num
+            track["missing"] = 0
+            track["updated"] = True
+
+            used_detections.add(best_i)
+
+    for i, c in enumerate(detections):
+        if i not in used_detections:
+            tracks.append({
+                "center": c,
+                "prev_center": None,
+                "vy": 0,
+                "last_seen": frame_num,
+                "missing": 0,
+                "updated": True,
+                "was_airborne": False,
+                "inside_hand_last_frame": False
+            })
+
+    kept_tracks = []
+
+    for track in tracks:
+        if not track["updated"]:
+            track["missing"] += 1
+
+        if track["missing"] <= BALL_TRACK_TTL:
+            kept_tracks.append(track)
+
+    return kept_tracks
+
+
+def save_csv(trials, fps, output_csv, video_name):
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "subj_code",
+            "jugg_condition",
+            "trial",
+            "consecutive_catches",
+            "start_time_seconds",
+            "end_time_seconds"
+        ])
+
+        for i, t in enumerate(trials, start=1):
+            catches = t["catches"]
+            start_time = round(t["start_frame"] / fps, 2)
+            end_time = round(t["end_frame"] / fps, 2)
+
+            writer.writerow([
+                video_name,
+                JUGG_CONDITION,
+                i,
+                catches,
+                start_time,
+                end_time
+            ])
+
+
+def process_video(video_path, output_csv, ball_model, hand_model):
+    video_name = Path(video_path).stem
+
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        print(f"Could not open video: {video_path}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    if fps <= 0:
+        fps = 30
+
+    start_frame = int(SKIP_SECONDS * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    frame_num = start_frame
+
+    width = OUTPUT_WIDTH
+    height = OUTPUT_HEIGHT
+
+    floor_ignore_y = int(height * FLOOR_IGNORE_PERCENT)
+
+    tracks = []
+    hand_boxes = []
+
+    total_catches = 0
+    current_trial_catches = 0
+    trials = []
+
+    trial_start_frame = None
+
+    last_catch_frame = -99999
+    last_trial_catch_frame = None
+
+    while True:
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+
+        detection_frame = frame.copy()
+        detection_frame[floor_ignore_y:height, :] = 0
+
+        ball_detections = get_yolo_objects(
+            ball_model,
+            detection_frame,
+            BALL_CONF,
+            MAX_BALLS_PER_FRAME
+        )
+
+        hand_detections = get_yolo_objects(
+            hand_model,
+            detection_frame,
+            HAND_CONF,
+            MAX_HANDS_PER_FRAME
+        )
+
+        filtered_ball_detections = []
+
+        for d in ball_detections:
+            cx, cy = d["center"]
+
+            if cy < floor_ignore_y:
+                filtered_ball_detections.append(d)
+
+        hand_boxes = update_hand_boxes(
+            hand_detections,
+            hand_boxes,
+            width,
+            height
+        )
+
+        tracks = update_ball_tracks(
+            filtered_ball_detections,
+            tracks,
+            frame_num
+        )
+
+        catch_detected = False
+        active_hand_boxes = [h["box"] for h in hand_boxes]
+
+        if len(active_hand_boxes) > 0:
+
+            for track in tracks:
+
+                if not track["updated"]:
+                    continue
+
+                c = track["center"]
+                vy = track["vy"]
+
+                inside_any_hand = any(point_in_box(c, b) for b in active_hand_boxes)
+
+                for hand_box in active_hand_boxes:
+                    hx1, hy1, hx2, hy2 = hand_box
+
+                    inside_this_hand = point_in_box(c, hand_box)
+
+                    above_this_hand = c[1] < hy1 - AIRBORNE_ABOVE_HAND_PIXELS
+
+                    if above_this_hand:
+                        track["was_airborne"] = True
+
+                    entering_hand = (
+                        inside_this_hand
+                        and not track["inside_hand_last_frame"]
+                        and track["was_airborne"]
+                        and vy >= MIN_DOWN_SPEED
+                    )
+
+                    if entering_hand:
+
+                        if frame_num - last_catch_frame >= MIN_FRAMES_BETWEEN_CATCHES:
+
+                            catch_detected = True
+                            track["was_airborne"] = False
+                            break
+
+                track["inside_hand_last_frame"] = inside_any_hand
+
+                if catch_detected:
+                    break
+
+        if catch_detected:
+
+            if last_trial_catch_frame is not None:
+
+                frames_since_last_catch = frame_num - last_trial_catch_frame
+
+                if frames_since_last_catch > int(TRIAL_GAP_SECONDS * fps):
+
+                    if current_trial_catches >= MIN_CATCHES_TO_SAVE_TRIAL:
+
+                        trials.append({
+                            "catches": current_trial_catches,
+                            "start_frame": trial_start_frame,
+                            "end_frame": last_trial_catch_frame
+                        })
+
+                        print(
+                            f"Trial {len(trials)} ended: "
+                            f"{current_trial_catches} consecutive catches"
+                        )
+
+                    current_trial_catches = 0
+                    trial_start_frame = None
+                    last_trial_catch_frame = None
+                    reset_catch_state_for_new_trial(tracks)
+
+            if current_trial_catches == 0:
+                trial_start_frame = frame_num
+
+            total_catches += 1
+            current_trial_catches += 1
+
+            last_catch_frame = frame_num
+            last_trial_catch_frame = frame_num
+
+            print(
+                f"Catch {total_catches} at frame {frame_num} | "
+                f"Current trial: {current_trial_catches}"
+            )
+
+        if not catch_detected and last_trial_catch_frame is not None:
+
+            frames_since_last_catch = frame_num - last_trial_catch_frame
+
+            if frames_since_last_catch > int(TRIAL_GAP_SECONDS * fps):
+
+                if current_trial_catches >= MIN_CATCHES_TO_SAVE_TRIAL:
+
+                    trials.append({
+                        "catches": current_trial_catches,
+                        "start_frame": trial_start_frame,
+                        "end_frame": last_trial_catch_frame
+                    })
+
+                    print(
+                        f"Trial {len(trials)} ended: "
+                        f"{current_trial_catches} consecutive catches"
+                    )
+
+                current_trial_catches = 0
+                trial_start_frame = None
+                last_trial_catch_frame = None
+                reset_catch_state_for_new_trial(tracks)
+
+        frame_num += 1
+
+    if current_trial_catches >= MIN_CATCHES_TO_SAVE_TRIAL:
+
+        trials.append({
+            "catches": current_trial_catches,
+            "start_frame": trial_start_frame,
+            "end_frame": last_trial_catch_frame
+        })
+
+        print(
+            f"Trial {len(trials)} ended: "
+            f"{current_trial_catches} consecutive catches"
+        )
+
+    cap.release()
+
+    save_csv(trials, fps, output_csv, video_name)
+
+    print("\n==============================")
+    print("CONSECUTIVE CATCHES BY TRIAL")
+    print("==============================")
+
+    for i, t in enumerate(trials, start=1):
+        print(
+            f"Trial {i}: {t['catches']} catches | "
+            f"Start: {round(t['start_frame'] / fps, 2)}s | "
+            f"End: {round(t['end_frame'] / fps, 2)}s"
+        )
+
+    print(f"\nTotal catches: {total_catches}")
+    print(f"Saved CSV: {output_csv}")
+
+
+def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    ball_model = YOLO(BALL_MODEL_PATH)
+    hand_model = YOLO(HAND_MODEL_PATH)
+
+    video_files = []
+
+    for ext in VIDEO_EXTENSIONS:
+        video_files.extend(Path(VIDEO_FOLDER).glob(f"*{ext}"))
+
+    video_files = sorted(video_files)
+
+    print(f"Found {len(video_files)} videos.")
+
+    for video_file in video_files:
+        video_name = video_file.stem
+        output_csv = Path(OUTPUT_FOLDER) / f"{video_name}.csv"
+
+        print("\n==============================")
+        print(f"Processing video: {video_file.name}")
+        print(f"Saving CSV as: {output_csv.name}")
+        print("==============================")
+
+        process_video(
+            str(video_file),
+            str(output_csv),
+            ball_model,
+            hand_model
+        )
+
+
+if __name__ == "__main__":
+    main()
