@@ -1,0 +1,638 @@
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from ultralytics import YOLO
+
+
+VIDEO_PATH = r"C:\Users\sooch\Downloads\2_light_1_heavy.mp4"
+
+OUTPUT_VIDEO = r"C:\Users\sooch\Downloads\2_light_1_heavy_annotated1.mp4"
+
+OUTPUT_BODY_CSV = r"C:\Users\sooch\Downloads\2_light_1_heavy_body_pose_coordinates.csv"
+
+OUTPUT_BALL_CSV = r"C:\Users\sooch\Downloads\2_light_1_heavy_ball_detection_coordinates.csv"
+
+
+# MODEL SETTINGS
+
+POSE_MODEL_PATH = "yolo11n-pose.pt"
+
+BALL_MODEL_PATH = "yolo26s.pt"
+
+# COCO sports ball class
+BALL_CLASS_ID = 32
+
+# Lower confidence = more potential detections
+# Also increases false positives
+BALL_CONFIDENCE = 0.08
+
+# Higher image size helps with small balls
+BALL_IMAGE_SIZE = 1536
+
+# Non-maximum suppression IoU threshold
+BALL_IOU = 0.50
+
+# Run second detection pass on enhanced image
+USE_ENHANCED_PASS = True
+
+# Maximum number of detections per pass
+BALL_MAX_DET = 100
+
+# Overlap threshold for merging duplicate detections
+MERGE_IOU = 0.40
+
+# Show live annotated video
+SHOW_VIDEO = True
+
+# Loading models
+
+print("Loading YOLO body pose model...")
+
+pose_model = YOLO(POSE_MODEL_PATH)
+
+print("Loading YOLO ball detection model...")
+
+ball_model = YOLO(BALL_MODEL_PATH)
+
+print("Models loaded successfully.")
+
+
+
+BODY_NAMES = [
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle"
+]
+
+
+def enhance_frame(frame):
+
+    # Improve local contrast
+    lab = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2LAB
+    )
+
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+
+    enhanced_l = clahe.apply(l)
+
+    enhanced_lab = cv2.merge(
+        (enhanced_l, a, b)
+    )
+
+    enhanced = cv2.cvtColor(
+        enhanced_lab,
+        cv2.COLOR_LAB2BGR
+    )
+
+    return enhanced
+
+
+def calculate_iou(box_a, box_b):
+
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+
+    intersection_width = max(0, x2 - x1)
+    intersection_height = max(0, y2 - y1)
+
+    intersection = (
+        intersection_width * intersection_height
+    )
+
+    area_a = max(
+        0,
+        (box_a[2] - box_a[0]) *
+        (box_a[3] - box_a[1])
+    )
+
+    area_b = max(
+        0,
+        (box_b[2] - box_b[0]) *
+        (box_b[3] - box_b[1])
+    )
+
+    union = area_a + area_b - intersection
+
+    if union <= 0:
+        return 0.0
+
+    return intersection / union
+
+
+def extract_ball_detections(result, pass_name):
+
+    detections = []
+
+    if result.boxes is None:
+        return detections
+
+    if len(result.boxes) == 0:
+        return detections
+
+    boxes = result.boxes.xyxy.cpu().numpy()
+    confidences = result.boxes.conf.cpu().numpy()
+
+    for box, confidence in zip(boxes, confidences):
+
+        detections.append({
+            "box": [
+                float(box[0]),
+                float(box[1]),
+                float(box[2]),
+                float(box[3])
+            ],
+            "confidence": float(confidence),
+            "source": pass_name
+        })
+
+    return detections
+
+def merge_detections(detections):
+
+    # Keep higher-confidence detections first
+    detections = sorted(
+        detections,
+        key=lambda d: d["confidence"],
+        reverse=True
+    )
+
+    kept = []
+
+    for detection in detections:
+
+        duplicate = False
+
+        for existing in kept:
+
+            overlap = calculate_iou(
+                detection["box"],
+                existing["box"]
+            )
+
+            if overlap >= MERGE_IOU:
+                duplicate = True
+                break
+
+        if not duplicate:
+            kept.append(detection)
+
+    return kept
+
+
+def detect_balls(frame):
+
+    all_detections = []
+
+    # PASS 1: Original frame
+    original_results = ball_model.predict(
+        source=frame,
+        classes=[BALL_CLASS_ID],
+        conf=BALL_CONFIDENCE,
+        imgsz=BALL_IMAGE_SIZE,
+        iou=BALL_IOU,
+        max_det=BALL_MAX_DET,
+        verbose=False
+    )
+
+    all_detections.extend(
+        extract_ball_detections(
+            original_results[0],
+            "original"
+        )
+    )
+
+    # PASS 2: Contrast-enhanced frame
+    if USE_ENHANCED_PASS:
+
+        enhanced_frame = enhance_frame(frame)
+
+        enhanced_results = ball_model.predict(
+            source=enhanced_frame,
+            classes=[BALL_CLASS_ID],
+            conf=BALL_CONFIDENCE,
+            imgsz=BALL_IMAGE_SIZE,
+            iou=BALL_IOU,
+            max_det=BALL_MAX_DET,
+            verbose=False
+        )
+
+        all_detections.extend(
+            extract_ball_detections(
+                enhanced_results[0],
+                "enhanced"
+            )
+        )
+
+    # Merge overlapping boxes
+    merged = merge_detections(
+        all_detections
+    )
+
+    return merged
+
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+if not cap.isOpened():
+    raise RuntimeError(
+        f"Could not open video: {VIDEO_PATH}"
+    )
+
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+if fps <= 0:
+    cap.release()
+    raise RuntimeError(
+        "Could not determine video FPS."
+    )
+
+width = int(
+    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+)
+
+height = int(
+    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+)
+
+total_frames = int(
+    cap.get(cv2.CAP_PROP_FRAME_COUNT)
+)
+
+print()
+print("======================================")
+print("VIDEO INFORMATION")
+print("======================================")
+print("FPS:", fps)
+print("Resolution:", width, "x", height)
+print("Total frames:", total_frames)
+print("Processing full video")
+print()
+
+# FOR OUTPUT VIDEO
+
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+writer = cv2.VideoWriter(
+    OUTPUT_VIDEO,
+    fourcc,
+    fps,
+    (width, height)
+)
+
+if not writer.isOpened():
+    cap.release()
+    raise RuntimeError(
+        "Could not create output video."
+    )
+
+# CSV Files
+
+body_data = []
+ball_data = []
+
+frame_number = 0
+
+total_ball_detections = 0
+
+
+try:
+
+    while True:
+
+        success, frame = cap.read()
+
+        if not success:
+            break
+
+        time_seconds = frame_number / fps
+
+        # ====================================================
+        # YOLO BODY POSE
+        # ====================================================
+
+        pose_results = pose_model.predict(
+            source=frame,
+            verbose=False
+        )
+
+        pose_result = pose_results[0]
+
+        # Draw body skeleton
+        annotated_frame = pose_result.plot()
+
+        # Extract body keypoints
+        if (
+            pose_result.keypoints is not None
+            and pose_result.keypoints.xy is not None
+        ):
+
+            keypoints_xy = (
+                pose_result.keypoints.xy
+                .cpu()
+                .numpy()
+            )
+
+            keypoints_conf = None
+
+            if pose_result.keypoints.conf is not None:
+
+                keypoints_conf = (
+                    pose_result.keypoints.conf
+                    .cpu()
+                    .numpy()
+                )
+
+            for person_id, person_points in enumerate(
+                keypoints_xy
+            ):
+
+                for keypoint_id, point in enumerate(
+                    person_points
+                ):
+
+                    x = float(point[0])
+                    y = float(point[1])
+
+                    confidence = None
+
+                    if keypoints_conf is not None:
+
+                        confidence = float(
+                            keypoints_conf[person_id][keypoint_id]
+                        )
+
+                    body_data.append({
+                        "frame": frame_number,
+                        "time_seconds": time_seconds,
+                        "person_id": person_id,
+                        "keypoint_id": keypoint_id,
+                        "keypoint_name": BODY_NAMES[keypoint_id],
+                        "x": x,
+                        "y": y,
+                        "confidence": confidence
+                    })
+
+        detections = detect_balls(frame)
+
+        # Sort detected balls from left to right
+        detections = sorted(
+            detections,
+            key=lambda d: (
+                d["box"][0] + d["box"][2]
+            ) / 2
+        )
+
+        for detection_id, detection in enumerate(
+            detections
+        ):
+
+            box = detection["box"]
+
+            x1 = float(box[0])
+            y1 = float(box[1])
+            x2 = float(box[2])
+            y2 = float(box[3])
+
+            confidence = detection["confidence"]
+
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+
+            box_width = x2 - x1
+            box_height = y2 - y1
+
+            total_ball_detections += 1
+
+
+            ball_data.append({
+                "frame": frame_number,
+                "time_seconds": time_seconds,
+                "detection_id": detection_id,
+                "center_x": center_x,
+                "center_y": center_y,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "box_width": box_width,
+                "box_height": box_height,
+                "confidence": confidence,
+                "detection_source": detection["source"]
+            })
+
+
+            cv2.rectangle(
+                annotated_frame,
+                (int(x1), int(y1)),
+                (int(x2), int(y2)),
+                (0, 0, 255),
+                2
+            )
+
+            # Draw centre point
+            cv2.circle(
+                annotated_frame,
+                (int(center_x), int(center_y)),
+                5,
+                (0, 0, 255),
+                -1
+            )
+
+            # Ball label
+            label = (
+                f"Ball {detection_id + 1} "
+                f"{confidence:.2f}"
+            )
+
+            cv2.putText(
+                annotated_frame,
+                label,
+                (int(x1), max(20, int(y1) - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 255),
+                2
+            )
+
+
+        cv2.putText(
+            annotated_frame,
+            f"Frame: {frame_number}",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            annotated_frame,
+            f"Time: {time_seconds:.2f}s",
+            (20, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            annotated_frame,
+            f"Balls detected: {len(detections)}",
+            (20, 105),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2
+        )
+
+
+
+        writer.write(annotated_frame)
+
+
+        if SHOW_VIDEO:
+
+            cv2.imshow(
+                "YOLO Pose + Ball Detection",
+                annotated_frame
+            )
+
+        frame_number += 1
+
+
+        if frame_number % 30 == 0:
+
+            print(
+                f"Processed {frame_number}/{total_frames} "
+                f"frames | "
+                f"{frame_number / fps:.1f}s | "
+                f"Total ball detections: "
+                f"{total_ball_detections}"
+            )
+
+        # Press Q to stop early
+        if SHOW_VIDEO:
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                print("Stopped early by user.")
+                break
+
+finally:
+
+
+    cap.release()
+    writer.release()
+    cv2.destroyAllWindows()
+
+# SAVE BODY CSV
+
+
+body_columns = [
+    "frame",
+    "time_seconds",
+    "person_id",
+    "keypoint_id",
+    "keypoint_name",
+    "x",
+    "y",
+    "confidence"
+]
+
+body_df = pd.DataFrame(
+    body_data,
+    columns=body_columns
+)
+
+body_df.to_csv(
+    OUTPUT_BODY_CSV,
+    index=False
+)
+
+
+# SAVE BALL CSV
+
+ball_columns = [
+    "frame",
+    "time_seconds",
+    "detection_id",
+    "center_x",
+    "center_y",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "box_width",
+    "box_height",
+    "confidence",
+    "detection_source"
+]
+
+ball_df = pd.DataFrame(
+    ball_data,
+    columns=ball_columns
+)
+
+ball_df.to_csv(
+    OUTPUT_BALL_CSV,
+    index=False
+)
+
+
+
+print()
+print("======================================")
+print("PROCESSING COMPLETE")
+print("======================================")
+
+print("Frames processed:", frame_number)
+
+print(
+    "Duration processed:",
+    round(frame_number / fps, 2),
+    "seconds"
+)
+
+print()
+print("Total ball detections:", total_ball_detections)
+
+print()
+print("Body coordinate rows:", len(body_df))
+print("Ball detection rows:", len(ball_df))
+
+print()
+print("Annotated video:")
+print(OUTPUT_VIDEO)
+
+print()
+print("Body coordinates CSV:")
+print(OUTPUT_BODY_CSV)
+
+print()
+print("Ball coordinates CSV:")
+print(OUTPUT_BALL_CSV)
